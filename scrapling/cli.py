@@ -814,6 +814,29 @@ def stealthy_fetch(
     __Request_and_Save(StealthyFetcher.fetch, url, output_file, css_selector, **kwargs)
 
 
+@command(help="Run Scrapling's REST API server (FastAPI + Uvicorn). Respects HOST/PORT env vars for deployment platforms like Railway.")
+@option(
+    "--host",
+    type=str,
+    default=None,
+    help="The host to bind the server to (Default: HOST env var or '0.0.0.0')",
+)
+@option(
+    "--port",
+    type=int,
+    default=None,
+    help="The port to bind the server to (Default: PORT env var or 8000)",
+)
+def api(host, port):
+    import os
+
+    from scrapling.api import run_server
+
+    host = host or os.environ.get("HOST", "0.0.0.0")
+    port = port or int(os.environ.get("PORT", "8000"))
+    run_server(host, port)
+
+
 @group()
 def main():
     pass
@@ -824,3 +847,4 @@ main.add_command(install)
 main.add_command(shell)
 main.add_command(extract)
 main.add_command(mcp)
+main.add_command(api)

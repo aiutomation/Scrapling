@@ -89,8 +89,13 @@ shell = [
     "markdownify>=1.2.0",
     "scrapling[fetchers]",
 ]
+api = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.34.0",
+    "scrapling[fetchers]",
+]
 all = [
-    "scrapling[ai,shell]",
+    "scrapling[ai,shell,api]",
 ]
 
 [project.urls]
