@@ -814,7 +814,9 @@ def stealthy_fetch(
     __Request_and_Save(StealthyFetcher.fetch, url, output_file, css_selector, **kwargs)
 
 
-@command(help="Run Scrapling's REST API server (FastAPI + Uvicorn). Respects HOST/PORT env vars for deployment platforms like Railway.")
+@command(
+    help="Run Scrapling's REST API server (FastAPI + Uvicorn). Respects HOST/PORT env vars for deployment platforms like Railway."
+)
 @option(
     "--host",
     type=str,

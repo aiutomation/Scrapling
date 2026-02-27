@@ -52,6 +52,7 @@ def _verify_api_key(api_key: Optional[str] = Security(_API_KEY_HEADER)) -> None:
 # Pydantic request models
 # ---------------------------------------------------------------------------
 
+
 class FetcherGetRequest(BaseModel):
     url: str
     headers: Optional[Dict[str, str]] = None
@@ -114,6 +115,7 @@ class ScrapeResponse(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _response_to_dict(response: Any, css_selector: Optional[str] = None, xpath_selector: Optional[str] = None) -> dict:
     """Convert a Scrapling Response object to a JSON-serializable dict."""
     # Extract headers as plain dict
@@ -142,7 +144,9 @@ def _response_to_dict(response: Any, css_selector: Optional[str] = None, xpath_s
     # Body as string
     body = ""
     try:
-        body = response.body.decode("utf-8", errors="replace") if isinstance(response.body, bytes) else str(response.body)
+        body = (
+            response.body.decode("utf-8", errors="replace") if isinstance(response.body, bytes) else str(response.body)
+        )
     except Exception:
         body = str(response)
 
@@ -239,6 +243,7 @@ def _build_stealthy_kwargs(req: StealthyFetchRequest) -> dict:
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
+
 
 def create_app() -> FastAPI:
     """Create and return the FastAPI application."""
