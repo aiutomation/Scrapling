@@ -1,3 +1,5 @@
+<!-- mcp-name: io.github.D4Vinci/Scrapling -->
+
 <h1 align="center">
     <a href="https://scrapling.readthedocs.io">
         <picture>
@@ -73,6 +75,7 @@ MySpider().start()
 
 # Patrocinadores Platino
 
+<i><sub>¿Quieres ser la primera empresa en aparecer aquí? Haz clic [aquí](https://github.com/sponsors/D4Vinci/sponsorships?tier_id=586646)</sub></i>
 # Patrocinadores
 
 <!-- sponsors -->
@@ -361,10 +364,19 @@ Esta instalación solo incluye el motor de análisis y sus dependencias, sin nin
     ```bash
     pip install "scrapling[fetchers]"
 
-    scrapling install
+    scrapling install           # normal install
+    scrapling install  --force  # force reinstall
     ```
 
     Esto descarga todos los navegadores, junto con sus dependencias del sistema y dependencias de manipulación de fingerprint.
+
+    O puedes instalarlos desde el código en lugar de ejecutar un comando:
+    ```python
+    from scrapling.cli import install
+
+    install([], standalone_mode=False)          # normal install
+    install(["--force"], standalone_mode=False) # force reinstall
+    ```
 
 2. Características adicionales:
    - Instalar la característica del servidor MCP:

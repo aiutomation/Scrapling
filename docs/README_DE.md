@@ -1,3 +1,5 @@
+<!-- mcp-name: io.github.D4Vinci/Scrapling -->
+
 <h1 align="center">
     <a href="https://scrapling.readthedocs.io">
         <picture>
@@ -73,6 +75,7 @@ MySpider().start()
 
 # Platin-Sponsoren
 
+<i><sub>Möchten Sie das erste Unternehmen sein, das hier erscheint? Klicken Sie [hier](https://github.com/sponsors/D4Vinci/sponsorships?tier_id=586646)</sub></i>
 # Sponsoren
 
 <!-- sponsors -->
@@ -361,10 +364,19 @@ Diese Installation enthält nur die Parser-Engine und ihre Abhängigkeiten, ohne
     ```bash
     pip install "scrapling[fetchers]"
 
-    scrapling install
+    scrapling install           # normal install
+    scrapling install  --force  # force reinstall
     ```
 
     Dies lädt alle Browser zusammen mit ihren Systemabhängigkeiten und Fingerprint-Manipulationsabhängigkeiten herunter.
+
+    Oder Sie können sie aus dem Code heraus installieren, anstatt einen Befehl auszuführen:
+    ```python
+    from scrapling.cli import install
+
+    install([], standalone_mode=False)          # normal install
+    install(["--force"], standalone_mode=False) # force reinstall
+    ```
 
 2. Zusätzliche Funktionen:
    - MCP-Server-Funktion installieren:

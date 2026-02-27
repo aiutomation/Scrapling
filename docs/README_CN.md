@@ -1,3 +1,5 @@
+<!-- mcp-name: io.github.D4Vinci/Scrapling -->
+
 <h1 align="center">
     <a href="https://scrapling.readthedocs.io">
         <picture>
@@ -73,6 +75,7 @@ MySpider().start()
 
 # 铂金赞助商
 
+<i><sub>想成为第一个出现在这里的公司吗？点击[这里](https://github.com/sponsors/D4Vinci/sponsorships?tier_id=586646)</sub></i>
 # 赞助商
 
 <!-- sponsors -->
@@ -361,10 +364,19 @@ pip install scrapling
     ```bash
     pip install "scrapling[fetchers]"
 
-    scrapling install
+    scrapling install           # normal install
+    scrapling install  --force  # force reinstall
     ```
 
     这会下载所有浏览器，以及它们的系统依赖项和fingerprint操作依赖项。
+
+    或者你可以从代码中安装，而不是运行命令：
+    ```python
+    from scrapling.cli import install
+
+    install([], standalone_mode=False)          # normal install
+    install(["--force"], standalone_mode=False) # force reinstall
+    ```
 
 2. 额外功能：
    - 安装MCP服务器功能：

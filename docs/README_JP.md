@@ -1,3 +1,5 @@
+<!-- mcp-name: io.github.D4Vinci/Scrapling -->
+
 <h1 align="center">
     <a href="https://scrapling.readthedocs.io">
         <picture>
@@ -73,6 +75,7 @@ MySpider().start()
 
 # プラチナスポンサー
 
+<i><sub>ここに最初に表示される企業になりませんか？[こちら](https://github.com/sponsors/D4Vinci/sponsorships?tier_id=586646)をクリック</sub></i>
 # スポンサー
 
 <!-- sponsors -->
@@ -361,10 +364,19 @@ pip install scrapling
     ```bash
     pip install "scrapling[fetchers]"
 
-    scrapling install
+    scrapling install           # normal install
+    scrapling install  --force  # force reinstall
     ```
 
     これにより、すべてのブラウザ、およびそれらのシステム依存関係とfingerprint操作依存関係がダウンロードされます。
+
+    または、コマンドを実行する代わりにコードからインストールすることもできます：
+    ```python
+    from scrapling.cli import install
+
+    install([], standalone_mode=False)          # normal install
+    install(["--force"], standalone_mode=False) # force reinstall
+    ```
 
 2. 追加機能：
    - MCPサーバー機能をインストール：

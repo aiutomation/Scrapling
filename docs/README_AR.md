@@ -1,3 +1,5 @@
+<!-- mcp-name: io.github.D4Vinci/Scrapling -->
+
 <h1 align="center">
     <a href="https://scrapling.readthedocs.io">
         <picture>
@@ -73,6 +75,7 @@ MySpider().start()
 
 # الرعاة البلاتينيون
 
+<i><sub>هل تريد أن تكون أول شركة تظهر هنا؟ انقر [هنا](https://github.com/sponsors/D4Vinci/sponsorships?tier_id=586646)</sub></i>
 # الرعاة
 
 <!-- sponsors -->
@@ -361,10 +364,19 @@ pip install scrapling
     ```bash
     pip install "scrapling[fetchers]"
 
-    scrapling install
+    scrapling install           # normal install
+    scrapling install  --force  # force reinstall
     ```
 
     يقوم هذا بتنزيل جميع المتصفحات، إلى جانب تبعيات النظام وتبعيات معالجة fingerprint الخاصة بها.
+
+    أو يمكنك تثبيتها من الكود بدلاً من تشغيل أمر كالتالي:
+    ```python
+    from scrapling.cli import install
+
+    install([], standalone_mode=False)          # normal install
+    install(["--force"], standalone_mode=False) # force reinstall
+    ```
 
 2. ميزات إضافية:
    - تثبيت ميزة خادم MCP:

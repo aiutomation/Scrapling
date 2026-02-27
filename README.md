@@ -78,6 +78,7 @@ MySpider().start()
 
 # Platinum Sponsors
 
+<i><sub>Do you want to be the first company to show up here? Click [here](https://github.com/sponsors/D4Vinci/sponsorships?tier_id=586646)</sub></i>
 # Sponsors 
 
 <!-- sponsors -->
@@ -366,10 +367,19 @@ This installation only includes the parser engine and its dependencies, without 
     ```bash
     pip install "scrapling[fetchers]"
     
-    scrapling install
+    scrapling install           # normal install
+    scrapling install  --force  # force reinstall
     ```
 
     This downloads all browsers, along with their system dependencies and fingerprint manipulation dependencies.
+
+    Or you can install them from the code instead of running a command like this:
+    ```python
+    from scrapling.cli import install
+    
+    install([], standalone_mode=False)          # normal install
+    install(["--force"], standalone_mode=False) # force reinstall
+    ```
 
 2. Extra features:
    - Install the MCP server feature:
