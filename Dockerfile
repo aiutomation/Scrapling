@@ -16,17 +16,13 @@ WORKDIR /app
 COPY pyproject.toml ./
 
 # Install dependencies only
-RUN --mount=type=cache,id=scrapling-uv-cache,target=/root/.cache/uv \
-    uv sync --no-install-project --all-extras --compile-bytecode
+RUN uv sync --no-install-project --all-extras --compile-bytecode
 
 # Copy source code
 COPY . .
 
 # Install browsers and project in one optimized layer
-RUN --mount=type=cache,id=scrapling-uv-cache,target=/root/.cache/uv \
-    --mount=type=cache,id=scrapling-apt-cache,target=/var/cache/apt \
-    --mount=type=cache,id=scrapling-apt-lib,target=/var/lib/apt \
-    apt-get update && \
+RUN apt-get update && \
     uv run playwright install-deps chromium && \
     uv run playwright install chromium && \
     uv sync --all-extras --compile-bytecode && \
