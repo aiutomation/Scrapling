@@ -7,6 +7,7 @@ Run with: scrapling api --host 0.0.0.0 --port 8000
 
 import os
 import secrets
+import threading
 from typing import Any, Dict, List, Optional
 
 try:
@@ -46,6 +47,15 @@ def _verify_api_key(api_key: Optional[str] = Security(_API_KEY_HEADER)) -> None:
         raise HTTPException(status_code=401, detail="Missing API key. Provide it via the X-API-Key header.")
     if not secrets.compare_digest(api_key, expected):
         raise HTTPException(status_code=403, detail="Invalid API key.")
+
+
+# ---------------------------------------------------------------------------
+# Browser concurrency control
+# ---------------------------------------------------------------------------
+
+_MAX_BROWSERS = int(os.environ.get("SCRAPLING_MAX_BROWSERS", "5"))
+_QUEUE_TIMEOUT = int(os.environ.get("SCRAPLING_BROWSER_QUEUE_TIMEOUT", "60"))
+_browser_semaphore = threading.Semaphore(_MAX_BROWSERS)
 
 
 # ---------------------------------------------------------------------------
@@ -333,11 +343,20 @@ def create_app() -> FastAPI:
         """Fetch a page using Scrapling's DynamicFetcher (Playwright/Chromium browser)."""
         from scrapling.fetchers import DynamicFetcher
 
-        kwargs = _build_dynamic_kwargs(req)
+        if not _browser_semaphore.acquire(timeout=_QUEUE_TIMEOUT):
+            raise HTTPException(
+                status_code=503,
+                detail="Server busy — too many concurrent browser requests. Try again shortly.",
+            )
         try:
+            kwargs = _build_dynamic_kwargs(req)
             response = DynamicFetcher.fetch(req.url, **kwargs)
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=502, detail=str(e))
+        finally:
+            _browser_semaphore.release()
 
         return JSONResponse(content=_response_to_dict(response, req.css_selector, req.xpath_selector))
 
@@ -350,11 +369,20 @@ def create_app() -> FastAPI:
         """Fetch a page using Scrapling's StealthyFetcher (stealth Chromium with anti-bot bypass)."""
         from scrapling.fetchers import StealthyFetcher
 
-        kwargs = _build_stealthy_kwargs(req)
+        if not _browser_semaphore.acquire(timeout=_QUEUE_TIMEOUT):
+            raise HTTPException(
+                status_code=503,
+                detail="Server busy — too many concurrent browser requests. Try again shortly.",
+            )
         try:
+            kwargs = _build_stealthy_kwargs(req)
             response = StealthyFetcher.fetch(req.url, **kwargs)
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=502, detail=str(e))
+        finally:
+            _browser_semaphore.release()
 
         return JSONResponse(content=_response_to_dict(response, req.css_selector, req.xpath_selector))
 

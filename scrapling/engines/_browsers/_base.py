@@ -1,3 +1,5 @@
+import os
+import threading
 from time import time
 from asyncio import sleep as asyncio_sleep, Lock
 from contextlib import contextmanager, asynccontextmanager
@@ -43,6 +45,9 @@ from scrapling.core._types import (
 from scrapling.engines.constants import STEALTH_ARGS, HARMFUL_ARGS, DEFAULT_ARGS
 
 
+_INACTIVITY_TIMEOUT = int(os.environ.get("SCRAPLING_BROWSER_TIMEOUT", "120"))
+
+
 class SyncSession:
     _config: "PlaywrightConfig | StealthConfig"
     _context_options: Dict[str, Any]
@@ -58,12 +63,35 @@ class SyncSession:
         self.context: Any = None
         self.browser: Any = None
         self._is_alive = False
+        self._watchdog: Optional[threading.Timer] = None
+
+    def _reset_watchdog(self) -> None:
+        """Reset the inactivity watchdog timer. Called on every browser operation."""
+        if self._watchdog:
+            self._watchdog.cancel()
+        self._watchdog = threading.Timer(_INACTIVITY_TIMEOUT, self._on_inactivity)
+        self._watchdog.daemon = True
+        self._watchdog.start()
+
+    def _on_inactivity(self) -> None:
+        """Called when the session has been inactive beyond the timeout. Force-closes everything."""
+        from scrapling.core.utils import log
+
+        log.warning("Browser session inactive for %ds — auto-closing to free resources.", _INACTIVITY_TIMEOUT)
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def start(self) -> None:
         pass
 
     def close(self):  # pragma: no cover
         """Close all resources"""
+        if self._watchdog:
+            self._watchdog.cancel()
+            self._watchdog = None
+
         if not self._is_alive:
             return
 
@@ -107,6 +135,7 @@ class SyncSession:
         context: Optional[BrowserContext] = None,
     ) -> PageInfo[Page]:  # pragma: no cover
         """Get a new page to use"""
+        self._reset_watchdog()
         # No need to check if a page is available or not in sync code because the code blocked before reaching here till the page closed, ofc.
         ctx = context if context is not None else self.context
         assert ctx is not None, "Browser context not initialized"
@@ -139,11 +168,13 @@ class SyncSession:
             pass
 
     def _wait_for_page_stability(self, page: Page | Frame, load_dom: bool, network_idle: bool):
+        self._reset_watchdog()
         page.wait_for_load_state(state="load")
         if load_dom:
             page.wait_for_load_state(state="domcontentloaded")
         if network_idle:
             self._wait_for_networkidle(page)
+        self._reset_watchdog()
 
     @staticmethod
     def _create_response_handler(page_info: PageInfo[Page], response_container: List) -> Callable:

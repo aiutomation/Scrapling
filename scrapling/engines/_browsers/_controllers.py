@@ -73,6 +73,7 @@ class DynamicSession(SyncSession, DynamicSessionMixin):
         """Create a browser for this instance and context."""
         if not self.playwright:
             self.playwright = sync_playwright().start()
+            self._reset_watchdog()
 
             try:
                 if self._config.cdp_url:  # pragma: no cover
@@ -91,6 +92,7 @@ class DynamicSession(SyncSession, DynamicSessionMixin):
                     self.context = self._initialize_context(self._config, self.context)
 
                 self._is_alive = True
+                self._reset_watchdog()
             except Exception:
                 # Clean up playwright if browser setup fails
                 self.playwright.stop()
