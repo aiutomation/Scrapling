@@ -54,8 +54,10 @@ def _verify_api_key(api_key: Optional[str] = Security(_API_KEY_HEADER)) -> None:
 # ---------------------------------------------------------------------------
 
 _MAX_BROWSERS = int(os.environ.get("SCRAPLING_MAX_BROWSERS", "5"))
+_MAX_FETCHERS = int(os.environ.get("SCRAPLING_MAX_FETCHERS", "20"))
 _QUEUE_TIMEOUT = int(os.environ.get("SCRAPLING_BROWSER_QUEUE_TIMEOUT", "60"))
 _browser_semaphore = threading.Semaphore(_MAX_BROWSERS)
+_fetcher_semaphore = threading.Semaphore(_MAX_FETCHERS)
 
 
 # ---------------------------------------------------------------------------
@@ -279,11 +281,20 @@ def create_app() -> FastAPI:
         """Perform an HTTP GET request using Scrapling's Fetcher (curl_cffi)."""
         from scrapling.fetchers import Fetcher
 
-        kwargs = _build_fetcher_kwargs(req)
+        if not _fetcher_semaphore.acquire(timeout=_QUEUE_TIMEOUT):
+            raise HTTPException(
+                status_code=503,
+                detail="Server busy — too many concurrent fetcher requests. Try again shortly.",
+            )
         try:
+            kwargs = _build_fetcher_kwargs(req)
             response = Fetcher.get(req.url, **kwargs)
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=502, detail=str(e))
+        finally:
+            _fetcher_semaphore.release()
 
         return JSONResponse(content=_response_to_dict(response, req.css_selector, req.xpath_selector))
 
@@ -292,15 +303,24 @@ def create_app() -> FastAPI:
         """Perform an HTTP POST request using Scrapling's Fetcher (curl_cffi)."""
         from scrapling.fetchers import Fetcher
 
-        kwargs = _build_fetcher_kwargs(req)
-        if req.data:
-            kwargs["data"] = req.data
-        if req.json_data is not None:
-            kwargs["json"] = req.json_data
+        if not _fetcher_semaphore.acquire(timeout=_QUEUE_TIMEOUT):
+            raise HTTPException(
+                status_code=503,
+                detail="Server busy — too many concurrent fetcher requests. Try again shortly.",
+            )
         try:
+            kwargs = _build_fetcher_kwargs(req)
+            if req.data:
+                kwargs["data"] = req.data
+            if req.json_data is not None:
+                kwargs["json"] = req.json_data
             response = Fetcher.post(req.url, **kwargs)
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=502, detail=str(e))
+        finally:
+            _fetcher_semaphore.release()
 
         return JSONResponse(content=_response_to_dict(response, req.css_selector, req.xpath_selector))
 
@@ -309,15 +329,24 @@ def create_app() -> FastAPI:
         """Perform an HTTP PUT request using Scrapling's Fetcher (curl_cffi)."""
         from scrapling.fetchers import Fetcher
 
-        kwargs = _build_fetcher_kwargs(req)
-        if req.data:
-            kwargs["data"] = req.data
-        if req.json_data is not None:
-            kwargs["json"] = req.json_data
+        if not _fetcher_semaphore.acquire(timeout=_QUEUE_TIMEOUT):
+            raise HTTPException(
+                status_code=503,
+                detail="Server busy — too many concurrent fetcher requests. Try again shortly.",
+            )
         try:
+            kwargs = _build_fetcher_kwargs(req)
+            if req.data:
+                kwargs["data"] = req.data
+            if req.json_data is not None:
+                kwargs["json"] = req.json_data
             response = Fetcher.put(req.url, **kwargs)
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=502, detail=str(e))
+        finally:
+            _fetcher_semaphore.release()
 
         return JSONResponse(content=_response_to_dict(response, req.css_selector, req.xpath_selector))
 
@@ -326,11 +355,20 @@ def create_app() -> FastAPI:
         """Perform an HTTP DELETE request using Scrapling's Fetcher (curl_cffi)."""
         from scrapling.fetchers import Fetcher
 
-        kwargs = _build_fetcher_kwargs(req)
+        if not _fetcher_semaphore.acquire(timeout=_QUEUE_TIMEOUT):
+            raise HTTPException(
+                status_code=503,
+                detail="Server busy — too many concurrent fetcher requests. Try again shortly.",
+            )
         try:
+            kwargs = _build_fetcher_kwargs(req)
             response = Fetcher.delete(req.url, **kwargs)
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=502, detail=str(e))
+        finally:
+            _fetcher_semaphore.release()
 
         return JSONResponse(content=_response_to_dict(response, req.css_selector, req.xpath_selector))
 
