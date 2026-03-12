@@ -55,8 +55,8 @@ def _verify_api_key(api_key: Optional[str] = Security(_API_KEY_HEADER)) -> None:
 # Browser concurrency control
 # ---------------------------------------------------------------------------
 
-_MAX_BROWSERS = int(os.environ.get("SCRAPLING_MAX_BROWSERS", "5"))
-_MAX_FETCHERS = int(os.environ.get("SCRAPLING_MAX_FETCHERS", "20"))
+_MAX_BROWSERS = int(os.environ.get("SCRAPLING_MAX_BROWSERS", "1"))
+_MAX_FETCHERS = int(os.environ.get("SCRAPLING_MAX_FETCHERS", "10"))
 _QUEUE_TIMEOUT = int(os.environ.get("SCRAPLING_BROWSER_QUEUE_TIMEOUT", "60"))
 # Bounded thread pool prevents OS thread exhaustion — all blocking fetcher/browser
 # work runs through this pool instead of FastAPI spawning unbounded threads.
@@ -410,6 +410,11 @@ def create_app() -> FastAPI:
             response = await loop.run_in_executor(_worker_pool, partial(DynamicFetcher.fetch, req.url, **kwargs))
         except HTTPException:
             raise
+        except (BlockingIOError, OSError):
+            raise HTTPException(
+                status_code=503,
+                detail="Server out of resources — cannot spawn browser process. Try again shortly.",
+            )
         except Exception as e:
             raise HTTPException(status_code=502, detail=str(e))
         finally:
@@ -437,6 +442,11 @@ def create_app() -> FastAPI:
             response = await loop.run_in_executor(_worker_pool, partial(StealthyFetcher.fetch, req.url, **kwargs))
         except HTTPException:
             raise
+        except (BlockingIOError, OSError):
+            raise HTTPException(
+                status_code=503,
+                detail="Server out of resources — cannot spawn browser process. Try again shortly.",
+            )
         except Exception as e:
             raise HTTPException(status_code=502, detail=str(e))
         finally:

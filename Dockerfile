@@ -10,7 +10,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # Railway injects PORT at runtime; default to 8000 for local dev
 ENV HOST=0.0.0.0 \
-    PORT=8000
+    PORT=8000 \
+    SCRAPLING_MAX_BROWSERS=1 \
+    SCRAPLING_MAX_FETCHERS=10 \
+    SCRAPLING_BROWSER_QUEUE_TIMEOUT=30
 
 WORKDIR /app
 
