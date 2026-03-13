@@ -6,8 +6,10 @@ Run with: scrapling api --host 0.0.0.0 --port 8000
 """
 
 import asyncio
+import logging
 import os
 import secrets
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Any, Dict, List, Optional
@@ -54,6 +56,8 @@ def _verify_api_key(api_key: Optional[str] = Security(_API_KEY_HEADER)) -> None:
 # ---------------------------------------------------------------------------
 # Browser concurrency control
 # ---------------------------------------------------------------------------
+
+logger = logging.getLogger("scrapling.api")
 
 _MAX_BROWSERS = int(os.environ.get("SCRAPLING_MAX_BROWSERS", "1"))
 _MAX_FETCHERS = int(os.environ.get("SCRAPLING_MAX_FETCHERS", "10"))
@@ -295,7 +299,9 @@ def create_app() -> FastAPI:
         """Perform an HTTP GET request using Scrapling's Fetcher (curl_cffi)."""
         from scrapling.fetchers import Fetcher
 
+        logger.info("[fetcher/get] url=%s", req.url)
         if not await _acquire_semaphore(_fetcher_semaphore, _QUEUE_TIMEOUT):
+            logger.warning("[fetcher/get] 503 queue timeout url=%s", req.url)
             raise HTTPException(
                 status_code=503,
                 detail="Server busy — too many concurrent fetcher requests. Try again shortly.",
@@ -307,10 +313,12 @@ def create_app() -> FastAPI:
         except HTTPException:
             raise
         except Exception as e:
+            logger.error("[fetcher/get] 502 url=%s error=%s\n%s", req.url, e, traceback.format_exc())
             raise HTTPException(status_code=502, detail=str(e))
         finally:
             _fetcher_semaphore.release()
 
+        logger.info("[fetcher/get] 200 url=%s status=%s", req.url, response.status)
         return JSONResponse(content=_response_to_dict(response, req.css_selector, req.xpath_selector))
 
     @app.post("/api/fetcher/post", response_model=ScrapeResponse, tags=["Fetcher"], dependencies=auth)
@@ -318,7 +326,9 @@ def create_app() -> FastAPI:
         """Perform an HTTP POST request using Scrapling's Fetcher (curl_cffi)."""
         from scrapling.fetchers import Fetcher
 
+        logger.info("[fetcher/post] url=%s", req.url)
         if not await _acquire_semaphore(_fetcher_semaphore, _QUEUE_TIMEOUT):
+            logger.warning("[fetcher/post] 503 queue timeout url=%s", req.url)
             raise HTTPException(
                 status_code=503,
                 detail="Server busy — too many concurrent fetcher requests. Try again shortly.",
@@ -334,10 +344,12 @@ def create_app() -> FastAPI:
         except HTTPException:
             raise
         except Exception as e:
+            logger.error("[fetcher/post] 502 url=%s error=%s\n%s", req.url, e, traceback.format_exc())
             raise HTTPException(status_code=502, detail=str(e))
         finally:
             _fetcher_semaphore.release()
 
+        logger.info("[fetcher/post] 200 url=%s status=%s", req.url, response.status)
         return JSONResponse(content=_response_to_dict(response, req.css_selector, req.xpath_selector))
 
     @app.post("/api/fetcher/put", response_model=ScrapeResponse, tags=["Fetcher"], dependencies=auth)
@@ -345,7 +357,9 @@ def create_app() -> FastAPI:
         """Perform an HTTP PUT request using Scrapling's Fetcher (curl_cffi)."""
         from scrapling.fetchers import Fetcher
 
+        logger.info("[fetcher/put] url=%s", req.url)
         if not await _acquire_semaphore(_fetcher_semaphore, _QUEUE_TIMEOUT):
+            logger.warning("[fetcher/put] 503 queue timeout url=%s", req.url)
             raise HTTPException(
                 status_code=503,
                 detail="Server busy — too many concurrent fetcher requests. Try again shortly.",
@@ -361,10 +375,12 @@ def create_app() -> FastAPI:
         except HTTPException:
             raise
         except Exception as e:
+            logger.error("[fetcher/put] 502 url=%s error=%s\n%s", req.url, e, traceback.format_exc())
             raise HTTPException(status_code=502, detail=str(e))
         finally:
             _fetcher_semaphore.release()
 
+        logger.info("[fetcher/put] 200 url=%s status=%s", req.url, response.status)
         return JSONResponse(content=_response_to_dict(response, req.css_selector, req.xpath_selector))
 
     @app.post("/api/fetcher/delete", response_model=ScrapeResponse, tags=["Fetcher"], dependencies=auth)
@@ -372,7 +388,9 @@ def create_app() -> FastAPI:
         """Perform an HTTP DELETE request using Scrapling's Fetcher (curl_cffi)."""
         from scrapling.fetchers import Fetcher
 
+        logger.info("[fetcher/delete] url=%s", req.url)
         if not await _acquire_semaphore(_fetcher_semaphore, _QUEUE_TIMEOUT):
+            logger.warning("[fetcher/delete] 503 queue timeout url=%s", req.url)
             raise HTTPException(
                 status_code=503,
                 detail="Server busy — too many concurrent fetcher requests. Try again shortly.",
@@ -384,10 +402,12 @@ def create_app() -> FastAPI:
         except HTTPException:
             raise
         except Exception as e:
+            logger.error("[fetcher/delete] 502 url=%s error=%s\n%s", req.url, e, traceback.format_exc())
             raise HTTPException(status_code=502, detail=str(e))
         finally:
             _fetcher_semaphore.release()
 
+        logger.info("[fetcher/delete] 200 url=%s status=%s", req.url, response.status)
         return JSONResponse(content=_response_to_dict(response, req.css_selector, req.xpath_selector))
 
     # -----------------------------------------------------------------------
@@ -399,7 +419,9 @@ def create_app() -> FastAPI:
         """Fetch a page using Scrapling's DynamicFetcher (Playwright/Chromium browser)."""
         from scrapling.fetchers import DynamicFetcher
 
+        logger.info("[dynamic/fetch] url=%s headless=%s network_idle=%s", req.url, req.headless, req.network_idle)
         if not await _acquire_semaphore(_browser_semaphore, _QUEUE_TIMEOUT):
+            logger.warning("[dynamic/fetch] 503 queue timeout url=%s (waited %ds)", req.url, _QUEUE_TIMEOUT)
             raise HTTPException(
                 status_code=503,
                 detail="Server busy — too many concurrent browser requests. Try again shortly.",
@@ -410,16 +432,21 @@ def create_app() -> FastAPI:
             response = await loop.run_in_executor(_worker_pool, partial(DynamicFetcher.fetch, req.url, **kwargs))
         except HTTPException:
             raise
-        except (BlockingIOError, OSError):
+        except (BlockingIOError, OSError) as e:
+            logger.error(
+                "[dynamic/fetch] 503 resource exhaustion url=%s error=%s\n%s", req.url, e, traceback.format_exc()
+            )
             raise HTTPException(
                 status_code=503,
-                detail="Server out of resources — cannot spawn browser process. Try again shortly.",
+                detail=f"Server out of resources — cannot spawn browser process: {e}",
             )
         except Exception as e:
+            logger.error("[dynamic/fetch] 502 url=%s error=%s\n%s", req.url, e, traceback.format_exc())
             raise HTTPException(status_code=502, detail=str(e))
         finally:
             _browser_semaphore.release()
 
+        logger.info("[dynamic/fetch] 200 url=%s status=%s", req.url, response.status)
         return JSONResponse(content=_response_to_dict(response, req.css_selector, req.xpath_selector))
 
     # -----------------------------------------------------------------------
@@ -431,7 +458,9 @@ def create_app() -> FastAPI:
         """Fetch a page using Scrapling's StealthyFetcher (stealth Chromium with anti-bot bypass)."""
         from scrapling.fetchers import StealthyFetcher
 
+        logger.info("[stealthy/fetch] url=%s headless=%s network_idle=%s", req.url, req.headless, req.network_idle)
         if not await _acquire_semaphore(_browser_semaphore, _QUEUE_TIMEOUT):
+            logger.warning("[stealthy/fetch] 503 queue timeout url=%s (waited %ds)", req.url, _QUEUE_TIMEOUT)
             raise HTTPException(
                 status_code=503,
                 detail="Server busy — too many concurrent browser requests. Try again shortly.",
@@ -442,12 +471,16 @@ def create_app() -> FastAPI:
             response = await loop.run_in_executor(_worker_pool, partial(StealthyFetcher.fetch, req.url, **kwargs))
         except HTTPException:
             raise
-        except (BlockingIOError, OSError):
+        except (BlockingIOError, OSError) as e:
+            logger.error(
+                "[stealthy/fetch] 503 resource exhaustion url=%s error=%s\n%s", req.url, e, traceback.format_exc()
+            )
             raise HTTPException(
                 status_code=503,
-                detail="Server out of resources — cannot spawn browser process. Try again shortly.",
+                detail=f"Server out of resources — cannot spawn browser process: {e}",
             )
         except Exception as e:
+            logger.error("[stealthy/fetch] 502 url=%s error=%s\n%s", req.url, e, traceback.format_exc())
             raise HTTPException(status_code=502, detail=str(e))
         finally:
             _browser_semaphore.release()
@@ -469,6 +502,15 @@ def create_app() -> FastAPI:
 def run_server(host: str = "0.0.0.0", port: int = 8000) -> None:
     """Start the Scrapling REST API server."""
     import uvicorn
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logger.info(
+        "Starting Scrapling API — MAX_BROWSERS=%d, MAX_FETCHERS=%d, QUEUE_TIMEOUT=%ds, POOL_WORKERS=%d",
+        _MAX_BROWSERS,
+        _MAX_FETCHERS,
+        _QUEUE_TIMEOUT,
+        _MAX_BROWSERS + _MAX_FETCHERS,
+    )
 
     app = create_app()
     uvicorn.run(app, host=host, port=port)
