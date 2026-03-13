@@ -8,6 +8,7 @@ Run with: scrapling api --host 0.0.0.0 --port 8000
 import asyncio
 import logging
 import os
+import queue
 import secrets
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -59,9 +60,11 @@ def _verify_api_key(api_key: Optional[str] = Security(_API_KEY_HEADER)) -> None:
 
 logger = logging.getLogger("scrapling.api")
 
-_MAX_BROWSERS = int(os.environ.get("SCRAPLING_MAX_BROWSERS", "1"))
+_MAX_BROWSERS = int(os.environ.get("SCRAPLING_MAX_BROWSERS", "3"))
 _MAX_FETCHERS = int(os.environ.get("SCRAPLING_MAX_FETCHERS", "10"))
 _QUEUE_TIMEOUT = int(os.environ.get("SCRAPLING_BROWSER_QUEUE_TIMEOUT", "60"))
+_EXECUTION_TIMEOUT = int(os.environ.get("SCRAPLING_EXECUTION_TIMEOUT", "120"))
+_MAX_RESPONSE_SIZE = int(os.environ.get("SCRAPLING_MAX_RESPONSE_SIZE", str(10 * 1024 * 1024)))  # 10MB
 # Bounded thread pool prevents OS thread exhaustion — all blocking fetcher/browser
 # work runs through this pool instead of FastAPI spawning unbounded threads.
 _worker_pool = ThreadPoolExecutor(max_workers=_MAX_BROWSERS + _MAX_FETCHERS)
@@ -76,6 +79,171 @@ async def _acquire_semaphore(sem: asyncio.Semaphore, timeout: int) -> bool:
         return True
     except asyncio.TimeoutError:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Browser session pool — reuses browser instances to avoid per-request
+# launch/teardown overhead. Sessions with default config are pooled;
+# requests with custom browser-level settings get one-off sessions.
+# ---------------------------------------------------------------------------
+
+
+class _BrowserSessionPool:
+    """Thread-safe pool of reusable browser sessions."""
+
+    def __init__(self, max_dynamic: int, max_stealthy: int):
+        self._dynamic: queue.Queue = queue.Queue(maxsize=max_dynamic)
+        self._stealthy: queue.Queue = queue.Queue(maxsize=max_stealthy)
+
+    def acquire_dynamic(self) -> Any:
+        """Get a pooled DynamicSession or create a new one."""
+        try:
+            session = self._dynamic.get_nowait()
+            if session._is_alive:
+                return session
+        except queue.Empty:
+            pass
+        from scrapling.engines._browsers._controllers import DynamicSession
+        from scrapling.engines.toolbelt.custom import BaseFetcher
+
+        session = DynamicSession(
+            headless=True,
+            selector_config={**BaseFetcher._generate_parser_arguments()},
+        )
+        session.start()
+        return session
+
+    def acquire_stealthy(self) -> Any:
+        """Get a pooled StealthySession or create a new one."""
+        try:
+            session = self._stealthy.get_nowait()
+            if session._is_alive:
+                return session
+        except queue.Empty:
+            pass
+        from scrapling.engines._browsers._stealth import StealthySession
+        from scrapling.engines.toolbelt.custom import BaseFetcher
+
+        session = StealthySession(
+            headless=True,
+            selector_config={**BaseFetcher._generate_parser_arguments()},
+        )
+        session.start()
+        return session
+
+    def release(self, session: Any, pool_type: str) -> None:
+        """Return a session to the pool, or close it if the pool is full."""
+        pool = self._dynamic if pool_type == "dynamic" else self._stealthy
+        try:
+            if session._is_alive:
+                pool.put_nowait(session)
+                return
+        except queue.Full:
+            pass
+        try:
+            session.close()
+        except Exception:
+            pass
+
+    def discard(self, session: Any) -> None:
+        """Close a session without returning it to the pool (after errors)."""
+        try:
+            session.close()
+        except Exception:
+            pass
+
+    def shutdown(self) -> None:
+        """Close all pooled sessions."""
+        for pool in (self._dynamic, self._stealthy):
+            while not pool.empty():
+                try:
+                    pool.get_nowait().close()
+                except Exception:
+                    pass
+
+
+_browser_pool = _BrowserSessionPool(max_dynamic=_MAX_BROWSERS, max_stealthy=_MAX_BROWSERS)
+
+
+def _is_poolable_dynamic(req: "DynamicFetchRequest") -> bool:
+    """Check if request can reuse a pooled default-config browser session."""
+    return (
+        req.headless is True
+        and req.real_chrome is False
+        and req.cdp_url is None
+        and req.locale is None
+        and req.useragent is None
+    )
+
+
+def _is_poolable_stealthy(req: "StealthyFetchRequest") -> bool:
+    """Check if stealthy request can reuse a pooled default-config session."""
+    return (
+        _is_poolable_dynamic(req) and req.allow_webgl is True and req.hide_canvas is False and req.block_webrtc is False
+    )
+
+
+def _build_fetch_only_kwargs(req: "DynamicFetchRequest") -> dict:
+    """Build kwargs for session.fetch() — fetch-level overridable params only."""
+    kwargs: Dict[str, Any] = {
+        "disable_resources": req.disable_resources,
+        "network_idle": req.network_idle,
+        "load_dom": req.load_dom,
+        "timeout": req.timeout,
+        "google_search": req.google_search,
+    }
+    if req.wait is not None:
+        kwargs["wait"] = req.wait
+    if req.wait_selector:
+        kwargs["wait_selector"] = req.wait_selector
+    if req.wait_selector_state:
+        kwargs["wait_selector_state"] = req.wait_selector_state
+    if req.proxy:
+        kwargs["proxy"] = req.proxy
+    if req.extra_headers:
+        kwargs["extra_headers"] = req.extra_headers
+    return kwargs
+
+
+def _build_stealthy_fetch_only_kwargs(req: "StealthyFetchRequest") -> dict:
+    """Build kwargs for StealthySession.fetch() — fetch-level params only."""
+    kwargs = _build_fetch_only_kwargs(req)
+    kwargs["solve_cloudflare"] = req.solve_cloudflare
+    return kwargs
+
+
+def _run_pooled_dynamic(url: str, req: "DynamicFetchRequest") -> Any:
+    """Run a dynamic fetch using pooled session when possible, else one-off."""
+    if not _is_poolable_dynamic(req):
+        from scrapling.fetchers import DynamicFetcher
+
+        return DynamicFetcher.fetch(url, **_build_dynamic_kwargs(req))
+
+    session = _browser_pool.acquire_dynamic()
+    try:
+        result = session.fetch(url, **_build_fetch_only_kwargs(req))
+    except Exception:
+        _browser_pool.discard(session)
+        raise
+    _browser_pool.release(session, "dynamic")
+    return result
+
+
+def _run_pooled_stealthy(url: str, req: "StealthyFetchRequest") -> Any:
+    """Run a stealthy fetch using pooled session when possible, else one-off."""
+    if not _is_poolable_stealthy(req):
+        from scrapling.fetchers import StealthyFetcher
+
+        return StealthyFetcher.fetch(url, **_build_stealthy_kwargs(req))
+
+    session = _browser_pool.acquire_stealthy()
+    try:
+        result = session.fetch(url, **_build_stealthy_fetch_only_kwargs(req))
+    except Exception:
+        _browser_pool.discard(session)
+        raise
+    _browser_pool.release(session, "stealthy")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -171,12 +339,18 @@ def _response_to_dict(response: Any, css_selector: Optional[str] = None, xpath_s
                 elif isinstance(cookie, dict):
                     resp_cookies.update(cookie)
 
-    # Body as string
+    # Body as string (truncated to _MAX_RESPONSE_SIZE to prevent OOM)
     body = ""
     try:
-        body = (
-            response.body.decode("utf-8", errors="replace") if isinstance(response.body, bytes) else str(response.body)
-        )
+        raw = response.body
+        if isinstance(raw, bytes):
+            if len(raw) > _MAX_RESPONSE_SIZE:
+                raw = raw[:_MAX_RESPONSE_SIZE]
+            body = raw.decode("utf-8", errors="replace")
+        else:
+            body = str(raw)
+            if len(body) > _MAX_RESPONSE_SIZE:
+                body = body[:_MAX_RESPONSE_SIZE]
     except Exception:
         body = str(response)
 
@@ -309,7 +483,13 @@ def create_app() -> FastAPI:
         try:
             kwargs = _build_fetcher_kwargs(req)
             loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(_worker_pool, partial(Fetcher.get, req.url, **kwargs))
+            response = await asyncio.wait_for(
+                loop.run_in_executor(_worker_pool, partial(Fetcher.get, req.url, **kwargs)),
+                timeout=_EXECUTION_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error("[fetcher/get] execution timeout (%ds) url=%s", _EXECUTION_TIMEOUT, req.url)
+            raise HTTPException(status_code=504, detail=f"Request timed out after {_EXECUTION_TIMEOUT}s.")
         except HTTPException:
             raise
         except Exception as e:
@@ -340,7 +520,13 @@ def create_app() -> FastAPI:
             if req.json_data is not None:
                 kwargs["json"] = req.json_data
             loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(_worker_pool, partial(Fetcher.post, req.url, **kwargs))
+            response = await asyncio.wait_for(
+                loop.run_in_executor(_worker_pool, partial(Fetcher.post, req.url, **kwargs)),
+                timeout=_EXECUTION_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error("[fetcher/post] execution timeout (%ds) url=%s", _EXECUTION_TIMEOUT, req.url)
+            raise HTTPException(status_code=504, detail=f"Request timed out after {_EXECUTION_TIMEOUT}s.")
         except HTTPException:
             raise
         except Exception as e:
@@ -371,7 +557,13 @@ def create_app() -> FastAPI:
             if req.json_data is not None:
                 kwargs["json"] = req.json_data
             loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(_worker_pool, partial(Fetcher.put, req.url, **kwargs))
+            response = await asyncio.wait_for(
+                loop.run_in_executor(_worker_pool, partial(Fetcher.put, req.url, **kwargs)),
+                timeout=_EXECUTION_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error("[fetcher/put] execution timeout (%ds) url=%s", _EXECUTION_TIMEOUT, req.url)
+            raise HTTPException(status_code=504, detail=f"Request timed out after {_EXECUTION_TIMEOUT}s.")
         except HTTPException:
             raise
         except Exception as e:
@@ -398,7 +590,13 @@ def create_app() -> FastAPI:
         try:
             kwargs = _build_fetcher_kwargs(req)
             loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(_worker_pool, partial(Fetcher.delete, req.url, **kwargs))
+            response = await asyncio.wait_for(
+                loop.run_in_executor(_worker_pool, partial(Fetcher.delete, req.url, **kwargs)),
+                timeout=_EXECUTION_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error("[fetcher/delete] execution timeout (%ds) url=%s", _EXECUTION_TIMEOUT, req.url)
+            raise HTTPException(status_code=504, detail=f"Request timed out after {_EXECUTION_TIMEOUT}s.")
         except HTTPException:
             raise
         except Exception as e:
@@ -417,8 +615,6 @@ def create_app() -> FastAPI:
     @app.post("/api/dynamic/fetch", response_model=ScrapeResponse, tags=["DynamicFetcher"], dependencies=auth)
     async def dynamic_fetch(req: DynamicFetchRequest):
         """Fetch a page using Scrapling's DynamicFetcher (Playwright/Chromium browser)."""
-        from scrapling.fetchers import DynamicFetcher
-
         logger.info("[dynamic/fetch] url=%s headless=%s network_idle=%s", req.url, req.headless, req.network_idle)
         if not await _acquire_semaphore(_browser_semaphore, _QUEUE_TIMEOUT):
             logger.warning("[dynamic/fetch] 503 queue timeout url=%s (waited %ds)", req.url, _QUEUE_TIMEOUT)
@@ -427,9 +623,17 @@ def create_app() -> FastAPI:
                 detail="Server busy — too many concurrent browser requests. Try again shortly.",
             )
         try:
-            kwargs = _build_dynamic_kwargs(req)
             loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(_worker_pool, partial(DynamicFetcher.fetch, req.url, **kwargs))
+            response = await asyncio.wait_for(
+                loop.run_in_executor(_worker_pool, partial(_run_pooled_dynamic, req.url, req)),
+                timeout=_EXECUTION_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error("[dynamic/fetch] execution timeout (%ds) url=%s", _EXECUTION_TIMEOUT, req.url)
+            raise HTTPException(
+                status_code=504,
+                detail=f"Browser request timed out after {_EXECUTION_TIMEOUT}s.",
+            )
         except HTTPException:
             raise
         except (BlockingIOError, OSError) as e:
@@ -456,8 +660,6 @@ def create_app() -> FastAPI:
     @app.post("/api/stealthy/fetch", response_model=ScrapeResponse, tags=["StealthyFetcher"], dependencies=auth)
     async def stealthy_fetch(req: StealthyFetchRequest):
         """Fetch a page using Scrapling's StealthyFetcher (stealth Chromium with anti-bot bypass)."""
-        from scrapling.fetchers import StealthyFetcher
-
         logger.info("[stealthy/fetch] url=%s headless=%s network_idle=%s", req.url, req.headless, req.network_idle)
         if not await _acquire_semaphore(_browser_semaphore, _QUEUE_TIMEOUT):
             logger.warning("[stealthy/fetch] 503 queue timeout url=%s (waited %ds)", req.url, _QUEUE_TIMEOUT)
@@ -466,9 +668,17 @@ def create_app() -> FastAPI:
                 detail="Server busy — too many concurrent browser requests. Try again shortly.",
             )
         try:
-            kwargs = _build_stealthy_kwargs(req)
             loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(_worker_pool, partial(StealthyFetcher.fetch, req.url, **kwargs))
+            response = await asyncio.wait_for(
+                loop.run_in_executor(_worker_pool, partial(_run_pooled_stealthy, req.url, req)),
+                timeout=_EXECUTION_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error("[stealthy/fetch] execution timeout (%ds) url=%s", _EXECUTION_TIMEOUT, req.url)
+            raise HTTPException(
+                status_code=504,
+                detail=f"Browser request timed out after {_EXECUTION_TIMEOUT}s.",
+            )
         except HTTPException:
             raise
         except (BlockingIOError, OSError) as e:
@@ -496,6 +706,13 @@ def create_app() -> FastAPI:
         """Health check endpoint (no authentication required)."""
         return {"status": "ok"}
 
+    @app.on_event("shutdown")
+    def shutdown_event():
+        """Clean up browser pool and thread pool on server shutdown."""
+        logger.info("Shutting down — closing browser pool and thread pool...")
+        _browser_pool.shutdown()
+        _worker_pool.shutdown(wait=False, cancel_futures=True)
+
     return app
 
 
@@ -505,10 +722,13 @@ def run_server(host: str = "0.0.0.0", port: int = 8000) -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logger.info(
-        "Starting Scrapling API — MAX_BROWSERS=%d, MAX_FETCHERS=%d, QUEUE_TIMEOUT=%ds, POOL_WORKERS=%d",
+        "Starting Scrapling API — MAX_BROWSERS=%d, MAX_FETCHERS=%d, QUEUE_TIMEOUT=%ds, "
+        "EXECUTION_TIMEOUT=%ds, MAX_RESPONSE_SIZE=%dMB, POOL_WORKERS=%d",
         _MAX_BROWSERS,
         _MAX_FETCHERS,
         _QUEUE_TIMEOUT,
+        _EXECUTION_TIMEOUT,
+        _MAX_RESPONSE_SIZE // (1024 * 1024),
         _MAX_BROWSERS + _MAX_FETCHERS,
     )
 

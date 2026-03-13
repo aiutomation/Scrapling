@@ -81,6 +81,7 @@ class StealthySession(SyncSession, StealthySessionMixin):
         """Create a browser for this instance and context."""
         if not self.playwright:
             self.playwright = sync_playwright().start()
+            self._reset_watchdog()
 
             try:
                 if self._config.cdp_url:  # pragma: no cover
@@ -100,6 +101,7 @@ class StealthySession(SyncSession, StealthySessionMixin):
                     self.context = self._initialize_context(self._config, self.context)
 
                 self._is_alive = True
+                self._reset_watchdog()
             except Exception:
                 # Clean up playwright if browser setup fails
                 self.playwright.stop()
@@ -108,12 +110,16 @@ class StealthySession(SyncSession, StealthySessionMixin):
         else:
             raise RuntimeError("Session has been already started")
 
-    def _cloudflare_solver(self, page: Page) -> None:  # pragma: no cover
+    def _cloudflare_solver(self, page: Page, _depth: int = 0) -> None:  # pragma: no cover
         """Solve the cloudflare challenge displayed on the playwright page passed
 
         :param page: The targeted page
+        :param _depth: Internal recursion counter (max 3 attempts)
         :return:
         """
+        if _depth >= 3:
+            log.warning("Cloudflare solver exceeded max attempts (3), giving up.")
+            return None
         self._wait_for_networkidle(page, timeout=5000)
         challenge_type = self._detect_cloudflare(ResponseFactory._get_page_content(page))
         if not challenge_type:
@@ -183,7 +189,7 @@ class StealthySession(SyncSession, StealthySessionMixin):
                     return None
                 else:
                     log.info("Looks like Cloudflare captcha is still present, solving again")
-                    return self._cloudflare_solver(page)
+                    return self._cloudflare_solver(page, _depth=_depth + 1)
 
     def fetch(self, url: str, **kwargs: Unpack[StealthFetchParams]) -> Response:
         """Opens up the browser and do your request based on your chosen options.
@@ -363,12 +369,16 @@ class AsyncStealthySession(AsyncSession, StealthySessionMixin):
         else:
             raise RuntimeError("Session has been already started")
 
-    async def _cloudflare_solver(self, page: async_Page) -> None:  # pragma: no cover
+    async def _cloudflare_solver(self, page: async_Page, _depth: int = 0) -> None:  # pragma: no cover
         """Solve the cloudflare challenge displayed on the playwright page passed
 
         :param page: The targeted page
+        :param _depth: Internal recursion counter (max 3 attempts)
         :return:
         """
+        if _depth >= 3:
+            log.warning("Cloudflare solver exceeded max attempts (3), giving up.")
+            return None
         await self._wait_for_networkidle(page, timeout=5000)
         challenge_type = self._detect_cloudflare(await ResponseFactory._get_async_page_content(page))
         if not challenge_type:
@@ -438,7 +448,7 @@ class AsyncStealthySession(AsyncSession, StealthySessionMixin):
                     return None
                 else:
                     log.info("Looks like Cloudflare captcha is still present, solving again")
-                    return await self._cloudflare_solver(page)
+                    return await self._cloudflare_solver(page, _depth=_depth + 1)
 
     async def fetch(self, url: str, **kwargs: Unpack[StealthFetchParams]) -> Response:
         """Opens up the browser and do your request based on your chosen options.
