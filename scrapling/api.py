@@ -108,6 +108,7 @@ class _BrowserSessionPool:
 
         session = DynamicSession(
             headless=True,
+            extra_flags=_CONTAINER_BROWSER_FLAGS,
             selector_config={**BaseFetcher._generate_parser_arguments()},
         )
         session.start()
@@ -126,6 +127,7 @@ class _BrowserSessionPool:
 
         session = StealthySession(
             headless=True,
+            extra_flags=_CONTAINER_BROWSER_FLAGS,
             selector_config={**BaseFetcher._generate_parser_arguments()},
         )
         session.start()
@@ -163,6 +165,15 @@ class _BrowserSessionPool:
 
 
 _browser_pool = _BrowserSessionPool(max_dynamic=_MAX_BROWSERS, max_stealthy=_MAX_BROWSERS)
+
+# Extra Chrome flags to reduce thread/process footprint in constrained containers.
+# Without these, Chromium spawns many sub-processes and threads which can exhaust
+# the container's PID/thread limits (pthread_create: Resource temporarily unavailable).
+_CONTAINER_BROWSER_FLAGS = [
+    "--renderer-process-limit=1",
+    "--disable-gpu",
+    "--disable-software-rasterizer",
+]
 
 
 def _is_poolable_dynamic(req: "DynamicFetchRequest") -> bool:
@@ -212,8 +223,28 @@ def _build_stealthy_fetch_only_kwargs(req: "StealthyFetchRequest") -> dict:
     return kwargs
 
 
+def _detach_event_loop() -> None:
+    """Detach the asyncio event loop from the current thread.
+
+    When ``run_in_executor`` dispatches work to a ``ThreadPoolExecutor``
+    thread, the thread can still "see" the parent's running event loop via
+    ``asyncio.get_running_loop()`` (Python ≥3.12 behaviour).  Patchright's
+    ``sync_playwright()`` checks for a running loop and raises
+    ``"Playwright Sync API inside the asyncio loop"`` if one is found.
+
+    Calling ``set_event_loop(None)`` on the worker thread prevents this
+    false-positive detection so that the synchronous Playwright/Patchright
+    API can be used safely from the executor.
+    """
+    try:
+        asyncio.set_event_loop(None)
+    except Exception:
+        pass
+
+
 def _run_pooled_dynamic(url: str, req: "DynamicFetchRequest") -> Any:
     """Run a dynamic fetch using pooled session when possible, else one-off."""
+    _detach_event_loop()
     if not _is_poolable_dynamic(req):
         from scrapling.fetchers import DynamicFetcher
 
@@ -231,6 +262,7 @@ def _run_pooled_dynamic(url: str, req: "DynamicFetchRequest") -> Any:
 
 def _run_pooled_stealthy(url: str, req: "StealthyFetchRequest") -> Any:
     """Run a stealthy fetch using pooled session when possible, else one-off."""
+    _detach_event_loop()
     if not _is_poolable_stealthy(req):
         from scrapling.fetchers import StealthyFetcher
 
