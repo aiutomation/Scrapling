@@ -60,7 +60,7 @@ def _verify_api_key(api_key: Optional[str] = Security(_API_KEY_HEADER)) -> None:
 
 logger = logging.getLogger("scrapling.api")
 
-_MAX_BROWSERS = int(os.environ.get("SCRAPLING_MAX_BROWSERS", "3"))
+_MAX_BROWSERS = int(os.environ.get("SCRAPLING_MAX_BROWSERS", "1"))
 _MAX_FETCHERS = int(os.environ.get("SCRAPLING_MAX_FETCHERS", "10"))
 _QUEUE_TIMEOUT = int(os.environ.get("SCRAPLING_BROWSER_QUEUE_TIMEOUT", "60"))
 _EXECUTION_TIMEOUT = int(os.environ.get("SCRAPLING_EXECUTION_TIMEOUT", "120"))
@@ -110,6 +110,11 @@ class _BrowserSessionPool:
                     pass
             except queue.Empty:
                 break
+        # Only detach the event loop right before creating a NEW session.
+        # sync_playwright().start() checks for a running asyncio loop and
+        # raises if one is found.  We must NOT detach when reusing a pooled
+        # session — doing so kills patchright's internal greenlet event loop.
+        _detach_event_loop()
         from scrapling.engines._browsers._controllers import DynamicSession
         from scrapling.engines.toolbelt.custom import BaseFetcher
 
@@ -135,6 +140,7 @@ class _BrowserSessionPool:
                     pass
             except queue.Empty:
                 break
+        _detach_event_loop()
         from scrapling.engines._browsers._stealth import StealthySession
         from scrapling.engines.toolbelt.custom import BaseFetcher
 
@@ -260,10 +266,16 @@ def _detach_event_loop() -> None:
         pass
 
 
+def _is_retryable_session_error(e: Exception) -> bool:
+    """Check if a pooled session error is retryable with a fresh session."""
+    msg = str(e)
+    return ("Target" in msg and "closed" in msg) or "no running event loop" in msg or "Event loop is closed" in msg
+
+
 def _run_pooled_dynamic(url: str, req: "DynamicFetchRequest") -> Any:
     """Run a dynamic fetch using pooled session when possible, else one-off."""
-    _detach_event_loop()
     if not _is_poolable_dynamic(req):
+        _detach_event_loop()
         from scrapling.fetchers import DynamicFetcher
 
         return DynamicFetcher.fetch(url, **_build_dynamic_kwargs(req))
@@ -273,9 +285,10 @@ def _run_pooled_dynamic(url: str, req: "DynamicFetchRequest") -> Any:
         result = session.fetch(url, **_build_fetch_only_kwargs(req))
     except Exception as e:
         _browser_pool.discard(session)
-        # If session was stale (closed by watchdog), retry once with fresh session
-        if "Target" in str(e) and "closed" in str(e):
-            logger.warning("[dynamic/fetch] Pooled session stale, retrying with fresh session for url=%s", url)
+        if _is_retryable_session_error(e):
+            logger.warning(
+                "[dynamic/fetch] Pooled session unusable (%s), retrying with fresh session for url=%s", e, url
+            )
             session = _browser_pool.acquire_dynamic()
             try:
                 result = session.fetch(url, **_build_fetch_only_kwargs(req))
@@ -291,8 +304,8 @@ def _run_pooled_dynamic(url: str, req: "DynamicFetchRequest") -> Any:
 
 def _run_pooled_stealthy(url: str, req: "StealthyFetchRequest") -> Any:
     """Run a stealthy fetch using pooled session when possible, else one-off."""
-    _detach_event_loop()
     if not _is_poolable_stealthy(req):
+        _detach_event_loop()
         from scrapling.fetchers import StealthyFetcher
 
         return StealthyFetcher.fetch(url, **_build_stealthy_kwargs(req))
@@ -302,8 +315,10 @@ def _run_pooled_stealthy(url: str, req: "StealthyFetchRequest") -> Any:
         result = session.fetch(url, **_build_stealthy_fetch_only_kwargs(req))
     except Exception as e:
         _browser_pool.discard(session)
-        if "Target" in str(e) and "closed" in str(e):
-            logger.warning("[stealthy/fetch] Pooled session stale, retrying with fresh session for url=%s", url)
+        if _is_retryable_session_error(e):
+            logger.warning(
+                "[stealthy/fetch] Pooled session unusable (%s), retrying with fresh session for url=%s", e, url
+            )
             session = _browser_pool.acquire_stealthy()
             try:
                 result = session.fetch(url, **_build_stealthy_fetch_only_kwargs(req))
