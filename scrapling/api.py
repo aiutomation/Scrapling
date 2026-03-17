@@ -97,12 +97,19 @@ class _BrowserSessionPool:
 
     def acquire_dynamic(self) -> Any:
         """Get a pooled DynamicSession or create a new one."""
-        try:
-            session = self._dynamic.get_nowait()
-            if session._is_alive:
-                return session
-        except queue.Empty:
-            pass
+        while True:
+            try:
+                session = self._dynamic.get_nowait()
+                if session._is_alive:
+                    session._reset_watchdog()
+                    return session
+                # Session died (watchdog closed it), discard and try next
+                try:
+                    session.close()
+                except Exception:
+                    pass
+            except queue.Empty:
+                break
         from scrapling.engines._browsers._controllers import DynamicSession
         from scrapling.engines.toolbelt.custom import BaseFetcher
 
@@ -116,12 +123,18 @@ class _BrowserSessionPool:
 
     def acquire_stealthy(self) -> Any:
         """Get a pooled StealthySession or create a new one."""
-        try:
-            session = self._stealthy.get_nowait()
-            if session._is_alive:
-                return session
-        except queue.Empty:
-            pass
+        while True:
+            try:
+                session = self._stealthy.get_nowait()
+                if session._is_alive:
+                    session._reset_watchdog()
+                    return session
+                try:
+                    session.close()
+                except Exception:
+                    pass
+            except queue.Empty:
+                break
         from scrapling.engines._browsers._stealth import StealthySession
         from scrapling.engines.toolbelt.custom import BaseFetcher
 
@@ -232,13 +245,18 @@ def _detach_event_loop() -> None:
     ``sync_playwright()`` checks for a running loop and raises
     ``"Playwright Sync API inside the asyncio loop"`` if one is found.
 
-    Calling ``set_event_loop(None)`` on the worker thread prevents this
-    false-positive detection so that the synchronous Playwright/Patchright
-    API can be used safely from the executor.
+    We clear the loop at both the Python and C levels to prevent
+    false-positive detection.
     """
     try:
         asyncio.set_event_loop(None)
     except Exception:
+        pass
+    # Also clear the C-level running loop reference that
+    # asyncio.get_running_loop() / asyncio._get_running_loop() checks.
+    try:
+        asyncio._set_running_loop(None)  # type: ignore[attr-defined]
+    except (AttributeError, Exception):
         pass
 
 
@@ -253,8 +271,19 @@ def _run_pooled_dynamic(url: str, req: "DynamicFetchRequest") -> Any:
     session = _browser_pool.acquire_dynamic()
     try:
         result = session.fetch(url, **_build_fetch_only_kwargs(req))
-    except Exception:
+    except Exception as e:
         _browser_pool.discard(session)
+        # If session was stale (closed by watchdog), retry once with fresh session
+        if "Target" in str(e) and "closed" in str(e):
+            logger.warning("[dynamic/fetch] Pooled session stale, retrying with fresh session for url=%s", url)
+            session = _browser_pool.acquire_dynamic()
+            try:
+                result = session.fetch(url, **_build_fetch_only_kwargs(req))
+            except Exception:
+                _browser_pool.discard(session)
+                raise
+            _browser_pool.release(session, "dynamic")
+            return result
         raise
     _browser_pool.release(session, "dynamic")
     return result
@@ -271,8 +300,18 @@ def _run_pooled_stealthy(url: str, req: "StealthyFetchRequest") -> Any:
     session = _browser_pool.acquire_stealthy()
     try:
         result = session.fetch(url, **_build_stealthy_fetch_only_kwargs(req))
-    except Exception:
+    except Exception as e:
         _browser_pool.discard(session)
+        if "Target" in str(e) and "closed" in str(e):
+            logger.warning("[stealthy/fetch] Pooled session stale, retrying with fresh session for url=%s", url)
+            session = _browser_pool.acquire_stealthy()
+            try:
+                result = session.fetch(url, **_build_stealthy_fetch_only_kwargs(req))
+            except Exception:
+                _browser_pool.discard(session)
+                raise
+            _browser_pool.release(session, "stealthy")
+            return result
         raise
     _browser_pool.release(session, "stealthy")
     return result
