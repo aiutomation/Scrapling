@@ -68,8 +68,29 @@ _MAX_RESPONSE_SIZE = int(os.environ.get("SCRAPLING_MAX_RESPONSE_SIZE", str(10 * 
 # Bounded thread pool prevents OS thread exhaustion — all blocking fetcher/browser
 # work runs through this pool instead of FastAPI spawning unbounded threads.
 _worker_pool = ThreadPoolExecutor(max_workers=_MAX_BROWSERS + _MAX_FETCHERS)
-_browser_semaphore = asyncio.Semaphore(_MAX_BROWSERS)
-_fetcher_semaphore = asyncio.Semaphore(_MAX_FETCHERS)
+
+# Semaphores MUST be created lazily inside the running asyncio event loop.
+# Creating asyncio.Semaphore() at module import time (before uvicorn starts its
+# event loop) causes "Future attached to a different loop" errors on every await,
+# which is why all requests return 502 immediately (~465ms — no browser work done).
+_browser_semaphore: Optional[asyncio.Semaphore] = None
+_fetcher_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def _get_browser_semaphore() -> asyncio.Semaphore:
+    """Return the browser semaphore, creating it lazily in the running event loop."""
+    global _browser_semaphore
+    if _browser_semaphore is None:
+        _browser_semaphore = asyncio.Semaphore(_MAX_BROWSERS)
+    return _browser_semaphore
+
+
+def _get_fetcher_semaphore() -> asyncio.Semaphore:
+    """Return the fetcher semaphore, creating it lazily in the running event loop."""
+    global _fetcher_semaphore
+    if _fetcher_semaphore is None:
+        _fetcher_semaphore = asyncio.Semaphore(_MAX_FETCHERS)
+    return _fetcher_semaphore
 
 
 async def _acquire_semaphore(sem: asyncio.Semaphore, timeout: int) -> bool:
@@ -560,7 +581,7 @@ def create_app() -> FastAPI:
         from scrapling.fetchers import Fetcher
 
         logger.info("[fetcher/get] url=%s", req.url)
-        if not await _acquire_semaphore(_fetcher_semaphore, _QUEUE_TIMEOUT):
+        if not await _acquire_semaphore(_get_fetcher_semaphore(), _QUEUE_TIMEOUT):
             logger.warning("[fetcher/get] 503 queue timeout url=%s", req.url)
             raise HTTPException(
                 status_code=503,
@@ -582,7 +603,7 @@ def create_app() -> FastAPI:
             logger.error("[fetcher/get] 502 url=%s error=%s\n%s", req.url, e, traceback.format_exc())
             raise HTTPException(status_code=502, detail=str(e))
         finally:
-            _fetcher_semaphore.release()
+            _get_fetcher_semaphore().release()
 
         logger.info("[fetcher/get] 200 url=%s status=%s", req.url, response.status)
         return JSONResponse(content=_response_to_dict(response, req.css_selector, req.xpath_selector))
@@ -593,7 +614,7 @@ def create_app() -> FastAPI:
         from scrapling.fetchers import Fetcher
 
         logger.info("[fetcher/post] url=%s", req.url)
-        if not await _acquire_semaphore(_fetcher_semaphore, _QUEUE_TIMEOUT):
+        if not await _acquire_semaphore(_get_fetcher_semaphore(), _QUEUE_TIMEOUT):
             logger.warning("[fetcher/post] 503 queue timeout url=%s", req.url)
             raise HTTPException(
                 status_code=503,
@@ -619,7 +640,7 @@ def create_app() -> FastAPI:
             logger.error("[fetcher/post] 502 url=%s error=%s\n%s", req.url, e, traceback.format_exc())
             raise HTTPException(status_code=502, detail=str(e))
         finally:
-            _fetcher_semaphore.release()
+            _get_fetcher_semaphore().release()
 
         logger.info("[fetcher/post] 200 url=%s status=%s", req.url, response.status)
         return JSONResponse(content=_response_to_dict(response, req.css_selector, req.xpath_selector))
@@ -630,7 +651,7 @@ def create_app() -> FastAPI:
         from scrapling.fetchers import Fetcher
 
         logger.info("[fetcher/put] url=%s", req.url)
-        if not await _acquire_semaphore(_fetcher_semaphore, _QUEUE_TIMEOUT):
+        if not await _acquire_semaphore(_get_fetcher_semaphore(), _QUEUE_TIMEOUT):
             logger.warning("[fetcher/put] 503 queue timeout url=%s", req.url)
             raise HTTPException(
                 status_code=503,
@@ -656,7 +677,7 @@ def create_app() -> FastAPI:
             logger.error("[fetcher/put] 502 url=%s error=%s\n%s", req.url, e, traceback.format_exc())
             raise HTTPException(status_code=502, detail=str(e))
         finally:
-            _fetcher_semaphore.release()
+            _get_fetcher_semaphore().release()
 
         logger.info("[fetcher/put] 200 url=%s status=%s", req.url, response.status)
         return JSONResponse(content=_response_to_dict(response, req.css_selector, req.xpath_selector))
@@ -667,7 +688,7 @@ def create_app() -> FastAPI:
         from scrapling.fetchers import Fetcher
 
         logger.info("[fetcher/delete] url=%s", req.url)
-        if not await _acquire_semaphore(_fetcher_semaphore, _QUEUE_TIMEOUT):
+        if not await _acquire_semaphore(_get_fetcher_semaphore(), _QUEUE_TIMEOUT):
             logger.warning("[fetcher/delete] 503 queue timeout url=%s", req.url)
             raise HTTPException(
                 status_code=503,
@@ -689,7 +710,7 @@ def create_app() -> FastAPI:
             logger.error("[fetcher/delete] 502 url=%s error=%s\n%s", req.url, e, traceback.format_exc())
             raise HTTPException(status_code=502, detail=str(e))
         finally:
-            _fetcher_semaphore.release()
+            _get_fetcher_semaphore().release()
 
         logger.info("[fetcher/delete] 200 url=%s status=%s", req.url, response.status)
         return JSONResponse(content=_response_to_dict(response, req.css_selector, req.xpath_selector))
@@ -702,7 +723,7 @@ def create_app() -> FastAPI:
     async def dynamic_fetch(req: DynamicFetchRequest):
         """Fetch a page using Scrapling's DynamicFetcher (Playwright/Chromium browser)."""
         logger.info("[dynamic/fetch] url=%s headless=%s network_idle=%s", req.url, req.headless, req.network_idle)
-        if not await _acquire_semaphore(_browser_semaphore, _QUEUE_TIMEOUT):
+        if not await _acquire_semaphore(_get_browser_semaphore(), _QUEUE_TIMEOUT):
             logger.warning("[dynamic/fetch] 503 queue timeout url=%s (waited %ds)", req.url, _QUEUE_TIMEOUT)
             raise HTTPException(
                 status_code=503,
@@ -734,7 +755,7 @@ def create_app() -> FastAPI:
             logger.error("[dynamic/fetch] 502 url=%s error=%s\n%s", req.url, e, traceback.format_exc())
             raise HTTPException(status_code=502, detail=str(e))
         finally:
-            _browser_semaphore.release()
+            _get_browser_semaphore().release()
 
         logger.info("[dynamic/fetch] 200 url=%s status=%s", req.url, response.status)
         return JSONResponse(content=_response_to_dict(response, req.css_selector, req.xpath_selector))
@@ -747,7 +768,7 @@ def create_app() -> FastAPI:
     async def stealthy_fetch(req: StealthyFetchRequest):
         """Fetch a page using Scrapling's StealthyFetcher (stealth Chromium with anti-bot bypass)."""
         logger.info("[stealthy/fetch] url=%s headless=%s network_idle=%s", req.url, req.headless, req.network_idle)
-        if not await _acquire_semaphore(_browser_semaphore, _QUEUE_TIMEOUT):
+        if not await _acquire_semaphore(_get_browser_semaphore(), _QUEUE_TIMEOUT):
             logger.warning("[stealthy/fetch] 503 queue timeout url=%s (waited %ds)", req.url, _QUEUE_TIMEOUT)
             raise HTTPException(
                 status_code=503,
@@ -779,7 +800,7 @@ def create_app() -> FastAPI:
             logger.error("[stealthy/fetch] 502 url=%s error=%s\n%s", req.url, e, traceback.format_exc())
             raise HTTPException(status_code=502, detail=str(e))
         finally:
-            _browser_semaphore.release()
+            _get_browser_semaphore().release()
 
         return JSONResponse(content=_response_to_dict(response, req.css_selector, req.xpath_selector))
 
