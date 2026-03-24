@@ -14,6 +14,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Any, Dict, List, Optional
+from urllib.request import Request, urlopen
 
 try:
     from fastapi import Depends, FastAPI, HTTPException, Security
@@ -25,6 +26,77 @@ except (ImportError, ModuleNotFoundError) as e:
         'You need to install scrapling with the "api" extra to enable the REST API server. '
         "Install it with: pip install scrapling[api]"
     ) from e
+
+
+# ---------------------------------------------------------------------------
+# Telegram error alerting (defined before Sentry so before_send can use it)
+# ---------------------------------------------------------------------------
+
+_TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+_TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+
+def _send_telegram_alert(message: str) -> None:
+    """Send a short error alert to the configured Telegram chat (fire-and-forget)."""
+    if not _TELEGRAM_BOT_TOKEN or not _TELEGRAM_CHAT_ID:
+        return
+    try:
+        import json
+
+        url = f"https://api.telegram.org/bot{_TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = json.dumps({"chat_id": _TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}).encode()
+        req = Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+        urlopen(req, timeout=5)  # nosec B310  # noqa: S310 — URL is hardcoded Telegram API
+    except Exception:
+        pass  # alerting should never crash the app
+
+
+# ---------------------------------------------------------------------------
+# Sentry SDK initialisation (after Telegram so before_send can forward alerts)
+# ---------------------------------------------------------------------------
+
+
+def _sentry_before_send(event: dict, hint: dict) -> dict:
+    """Forward every Sentry error event to Telegram, then let Sentry process it."""
+    exc_info = hint.get("exc_info")
+    if exc_info:
+        exc_type, exc_value, _ = exc_info
+        exc_name = exc_type.__name__ if exc_type else "Unknown"
+        exc_msg = str(exc_value) if exc_value else ""
+    else:
+        exc_name = event.get("exception", {}).get("values", [{}])[0].get("type", "Error")
+        exc_msg = event.get("exception", {}).get("values", [{}])[0].get("value", "")
+
+    event_id = event.get("event_id", "")[:12]
+    level = event.get("level", "error").upper()
+    request_data = event.get("request", {})
+    url = request_data.get("url", "")
+    method = request_data.get("method", "")
+
+    lines = [f"<b>🔴 Sentry {level}</b>"]
+    if method and url:
+        lines.append(f"<b>Request:</b> {method} {url}")
+    lines.append(f"<b>Error:</b> <code>{exc_name}: {exc_msg}</code>")
+    lines.append(f"<b>Event:</b> <code>{event_id}</code>")
+
+    _send_telegram_alert("\n".join(lines))
+    return event  # pass event through to Sentry
+
+
+_SENTRY_DSN = os.environ.get("SENTRY_DSN")
+if _SENTRY_DSN:
+    try:
+        import sentry_sdk
+
+        sentry_sdk.init(
+            dsn=_SENTRY_DSN,
+            traces_sample_rate=float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "0.1")),
+            environment=os.environ.get("SENTRY_ENVIRONMENT", "production"),
+            send_default_pii=True,
+            before_send=_sentry_before_send,
+        )
+    except ImportError:
+        pass  # sentry-sdk not installed — skip silently
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +643,22 @@ def create_app() -> FastAPI:
     # Shared dependency for all protected endpoints
     auth = [Depends(_verify_api_key)]
 
+    # Global exception handler — sends Telegram alert for unhandled errors
+    @app.exception_handler(Exception)
+    async def _global_exception_handler(request, exc):
+        endpoint = request.url.path
+        method = request.method
+        msg = (
+            f"<b>Scrapling API Error</b>\n"
+            f"<b>Endpoint:</b> {method} {endpoint}\n"
+            f"<b>Error:</b> <code>{type(exc).__name__}: {exc}</code>"
+        )
+        _send_telegram_alert(msg)
+        # Re-raise HTTPExceptions as-is, wrap others in 500
+        if isinstance(exc, HTTPException):
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
     # -----------------------------------------------------------------------
     # Fetcher endpoints (HTTP-based scraping)
     # -----------------------------------------------------------------------
@@ -813,10 +901,16 @@ def create_app() -> FastAPI:
         """Health check endpoint (no authentication required)."""
         return {"status": "ok"}
 
+    @app.on_event("startup")
+    def startup_event():
+        """Notify that the server is live."""
+        _send_telegram_alert("<b>Scrapling API</b>\nServer is live and accepting requests.")
+
     @app.on_event("shutdown")
     def shutdown_event():
         """Clean up browser pool and thread pool on server shutdown."""
         logger.info("Shutting down — closing browser pool and thread pool...")
+        _send_telegram_alert("<b>Scrapling API</b>\nServer is shutting down.")
         _browser_pool.shutdown()
         _worker_pool.shutdown(wait=False, cancel_futures=True)
 
@@ -825,12 +919,16 @@ def create_app() -> FastAPI:
 
 def run_server(host: str = "0.0.0.0", port: int = 8000) -> None:
     """Start the Scrapling REST API server."""
+    import sys
+
     import uvicorn
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logger.info(
-        "Starting Scrapling API — MAX_BROWSERS=%d, MAX_FETCHERS=%d, QUEUE_TIMEOUT=%ds, "
-        "EXECUTION_TIMEOUT=%ds, MAX_RESPONSE_SIZE=%dMB, POOL_WORKERS=%d",
+        "Starting Scrapling API — host=%s, port=%d, MAX_BROWSERS=%d, MAX_FETCHERS=%d, "
+        "QUEUE_TIMEOUT=%ds, EXECUTION_TIMEOUT=%ds, MAX_RESPONSE_SIZE=%dMB, POOL_WORKERS=%d",
+        host,
+        port,
         _MAX_BROWSERS,
         _MAX_FETCHERS,
         _QUEUE_TIMEOUT,
@@ -839,5 +937,15 @@ def run_server(host: str = "0.0.0.0", port: int = 8000) -> None:
         _MAX_BROWSERS + _MAX_FETCHERS,
     )
 
-    app = create_app()
-    uvicorn.run(app, host=host, port=port)
+    try:
+        _send_telegram_alert("<b>Scrapling API</b>\nServer starting...")
+        app = create_app()
+        uvicorn.run(app, host=host, port=port)
+    except Exception as e:
+        logger.critical("Server failed to start", exc_info=True)
+        _send_telegram_alert(
+            f"<b>Scrapling API CRASH</b>\n"
+            f"<b>Error:</b> <code>{type(e).__name__}: {e}</code>\n"
+            f"Server failed to start on {host}:{port}"
+        )
+        sys.exit(1)
