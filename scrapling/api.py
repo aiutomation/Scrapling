@@ -29,26 +29,7 @@ except (ImportError, ModuleNotFoundError) as e:
 
 
 # ---------------------------------------------------------------------------
-# Sentry SDK initialisation
-# ---------------------------------------------------------------------------
-
-_SENTRY_DSN = os.environ.get("SENTRY_DSN")
-if _SENTRY_DSN:
-    try:
-        import sentry_sdk
-
-        sentry_sdk.init(
-            dsn=_SENTRY_DSN,
-            traces_sample_rate=float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "0.1")),
-            environment=os.environ.get("SENTRY_ENVIRONMENT", "production"),
-            send_default_pii=True,
-        )
-    except ImportError:
-        pass  # sentry-sdk not installed — skip silently
-
-
-# ---------------------------------------------------------------------------
-# Telegram error alerting
+# Telegram error alerting (defined before Sentry so before_send can use it)
 # ---------------------------------------------------------------------------
 
 _TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -68,6 +49,54 @@ def _send_telegram_alert(message: str) -> None:
         urlopen(req, timeout=5)  # nosec B310  # noqa: S310 — URL is hardcoded Telegram API
     except Exception:
         pass  # alerting should never crash the app
+
+
+# ---------------------------------------------------------------------------
+# Sentry SDK initialisation (after Telegram so before_send can forward alerts)
+# ---------------------------------------------------------------------------
+
+
+def _sentry_before_send(event: dict, hint: dict) -> dict:
+    """Forward every Sentry error event to Telegram, then let Sentry process it."""
+    exc_info = hint.get("exc_info")
+    if exc_info:
+        exc_type, exc_value, _ = exc_info
+        exc_name = exc_type.__name__ if exc_type else "Unknown"
+        exc_msg = str(exc_value) if exc_value else ""
+    else:
+        exc_name = event.get("exception", {}).get("values", [{}])[0].get("type", "Error")
+        exc_msg = event.get("exception", {}).get("values", [{}])[0].get("value", "")
+
+    event_id = event.get("event_id", "")[:12]
+    level = event.get("level", "error").upper()
+    request_data = event.get("request", {})
+    url = request_data.get("url", "")
+    method = request_data.get("method", "")
+
+    lines = [f"<b>🔴 Sentry {level}</b>"]
+    if method and url:
+        lines.append(f"<b>Request:</b> {method} {url}")
+    lines.append(f"<b>Error:</b> <code>{exc_name}: {exc_msg}</code>")
+    lines.append(f"<b>Event:</b> <code>{event_id}</code>")
+
+    _send_telegram_alert("\n".join(lines))
+    return event  # pass event through to Sentry
+
+
+_SENTRY_DSN = os.environ.get("SENTRY_DSN")
+if _SENTRY_DSN:
+    try:
+        import sentry_sdk
+
+        sentry_sdk.init(
+            dsn=_SENTRY_DSN,
+            traces_sample_rate=float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "0.1")),
+            environment=os.environ.get("SENTRY_ENVIRONMENT", "production"),
+            send_default_pii=True,
+            before_send=_sentry_before_send,
+        )
+    except ImportError:
+        pass  # sentry-sdk not installed — skip silently
 
 
 # ---------------------------------------------------------------------------
