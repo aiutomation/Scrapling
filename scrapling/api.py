@@ -825,12 +825,16 @@ def create_app() -> FastAPI:
 
 def run_server(host: str = "0.0.0.0", port: int = 8000) -> None:
     """Start the Scrapling REST API server."""
+    import sys
+
     import uvicorn
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logger.info(
-        "Starting Scrapling API — MAX_BROWSERS=%d, MAX_FETCHERS=%d, QUEUE_TIMEOUT=%ds, "
-        "EXECUTION_TIMEOUT=%ds, MAX_RESPONSE_SIZE=%dMB, POOL_WORKERS=%d",
+        "Starting Scrapling API — host=%s, port=%d, MAX_BROWSERS=%d, MAX_FETCHERS=%d, "
+        "QUEUE_TIMEOUT=%ds, EXECUTION_TIMEOUT=%ds, MAX_RESPONSE_SIZE=%dMB, POOL_WORKERS=%d",
+        host,
+        port,
         _MAX_BROWSERS,
         _MAX_FETCHERS,
         _QUEUE_TIMEOUT,
@@ -839,5 +843,9 @@ def run_server(host: str = "0.0.0.0", port: int = 8000) -> None:
         _MAX_BROWSERS + _MAX_FETCHERS,
     )
 
-    app = create_app()
-    uvicorn.run(app, host=host, port=port)
+    try:
+        app = create_app()
+        uvicorn.run(app, host=host, port=port)
+    except Exception:
+        logger.critical("Server failed to start", exc_info=True)
+        sys.exit(1)
