@@ -65,7 +65,18 @@ def _is_asyncio_playwright_noise(event: dict, hint: dict) -> bool:
     logging, which Sentry's LoggingIntegration captures as separate events.
     These are noise — not user-facing failures — and should be dropped.
     """
-    if event.get("logger") != "asyncio":
+    # The logger name can appear in the top-level "logger" field OR as a tag
+    # (Sentry's LoggingIntegration puts it in tags, not the top-level field).
+    logger = event.get("logger") or ""
+    if not logger:
+        for tag in event.get("tags", []):
+            if isinstance(tag, (list, tuple)) and len(tag) == 2 and tag[0] == "logger":
+                logger = tag[1]
+                break
+            elif isinstance(tag, dict) and tag.get("key") == "logger":
+                logger = tag.get("value", "")
+                break
+    if logger != "asyncio":
         return False
 
     # Check exception values for known Playwright lifecycle errors
