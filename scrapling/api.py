@@ -226,6 +226,7 @@ class _BrowserSessionPool:
             )
             try:
                 session.start()
+                _circuit_breaker_record_success()
                 return session
             except (BlockingIOError, OSError) as e:
                 last_exc = e
@@ -239,6 +240,7 @@ class _BrowserSessionPool:
                 )
                 _kill_zombie_browsers()
                 time.sleep(delay)
+        _circuit_breaker_record_failure()
         raise last_exc  # type: ignore[misc]
 
     def acquire_stealthy(self) -> Any:
@@ -274,6 +276,7 @@ class _BrowserSessionPool:
             )
             try:
                 session.start()
+                _circuit_breaker_record_success()
                 return session
             except (BlockingIOError, OSError) as e:
                 last_exc = e
@@ -287,6 +290,7 @@ class _BrowserSessionPool:
                 )
                 _kill_zombie_browsers()
                 time.sleep(delay)
+        _circuit_breaker_record_failure()
         raise last_exc  # type: ignore[misc]
 
     def release(self, session: Any, pool_type: str) -> None:
@@ -338,20 +342,81 @@ _CONTAINER_BROWSER_FLAGS = [
 _SPAWN_MAX_RETRIES = int(os.environ.get("SCRAPLING_SPAWN_RETRIES", "3"))
 _SPAWN_BACKOFF_BASE = float(os.environ.get("SCRAPLING_SPAWN_BACKOFF", "1.5"))
 
+# Circuit breaker: after consecutive spawn failures, reject browser requests
+# immediately for a cooldown period instead of letting them queue and fail.
+_CIRCUIT_BREAKER_THRESHOLD = int(os.environ.get("SCRAPLING_CB_THRESHOLD", "3"))
+_CIRCUIT_BREAKER_COOLDOWN = float(os.environ.get("SCRAPLING_CB_COOLDOWN", "30.0"))
+_circuit_breaker_failures: int = 0
+_circuit_breaker_open_until: float = 0.0
+
+
+def _circuit_breaker_record_failure() -> None:
+    """Record a browser spawn failure; open the circuit if threshold reached."""
+    import time as _time
+
+    global _circuit_breaker_failures, _circuit_breaker_open_until
+    _circuit_breaker_failures += 1
+    if _circuit_breaker_failures >= _CIRCUIT_BREAKER_THRESHOLD:
+        _circuit_breaker_open_until = _time.monotonic() + _CIRCUIT_BREAKER_COOLDOWN
+        logger.warning(
+            "[circuit-breaker] OPEN — %d consecutive spawn failures, rejecting browser requests for %.0fs",
+            _circuit_breaker_failures,
+            _CIRCUIT_BREAKER_COOLDOWN,
+        )
+
+
+def _circuit_breaker_record_success() -> None:
+    """Reset the circuit breaker after a successful browser spawn."""
+    global _circuit_breaker_failures, _circuit_breaker_open_until
+    _circuit_breaker_failures = 0
+    _circuit_breaker_open_until = 0.0
+
+
+def _circuit_breaker_is_open() -> bool:
+    """Check if the circuit breaker is currently open (rejecting requests)."""
+    import time as _time
+
+    if _circuit_breaker_open_until <= 0:
+        return False
+    if _time.monotonic() >= _circuit_breaker_open_until:
+        # Cooldown elapsed — half-open: allow one attempt through
+        logger.info("[circuit-breaker] cooldown elapsed, allowing next attempt (half-open)")
+        return False
+    return True
+
 
 def _kill_zombie_browsers() -> None:
-    """Best-effort cleanup of orphaned chromium/playwright node processes."""
+    """Best-effort cleanup of orphaned chromium/playwright node processes.
+
+    Only kills processes whose parent is PID 1 (orphaned) to avoid killing
+    browser sessions that the pool is actively using.
+    """
     import subprocess as _sp
 
-    for pattern in ("chromium", "chrome", "playwright"):
+    try:
+        # Find orphaned chromium processes (parent PID = 1 means they were reparented)
+        result = _sp.run(  # nosec B603 B607
+            ["sh", "-c", "ps -eo pid,ppid,comm 2>/dev/null | grep -E 'chrom|playwright' | awk '$2 == 1 {print $1}'"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        pids = result.stdout.strip().split()
+        for pid in pids:
+            if pid:
+                try:
+                    _sp.run(["kill", "-9", pid], capture_output=True, timeout=2)  # nosec B603 B607
+                    logger.info("[pool] killed orphaned process pid=%s", pid)
+                except Exception:
+                    pass
+    except Exception:
+        # Fallback: only kill playwright driver processes, not all chromium
         try:
-            result = _sp.run(  # nosec B603 B607 — pattern is a hardcoded constant, not user input
-                ["pkill", "-f", pattern],
+            _sp.run(  # nosec B603 B607
+                ["pkill", "-f", "playwright.*run-driver"],
                 capture_output=True,
                 timeout=3,
             )
-            if result.returncode == 0:
-                logger.info("[pool] killed zombie processes matching %r", pattern)
         except Exception:
             pass
 
@@ -430,7 +495,12 @@ def _detach_event_loop() -> None:
 def _is_retryable_session_error(e: Exception) -> bool:
     """Check if a pooled session error is retryable with a fresh session."""
     msg = str(e)
-    return ("Target" in msg and "closed" in msg) or "no running event loop" in msg or "Event loop is closed" in msg
+    return (
+        ("Target" in msg and "closed" in msg)
+        or "no running event loop" in msg
+        or "Event loop is closed" in msg
+        or "switch to a different thread" in msg.lower()
+    )
 
 
 def _run_pooled_dynamic(url: str, req: "DynamicFetchRequest") -> Any:
@@ -879,6 +949,12 @@ def create_app() -> FastAPI:
     async def dynamic_fetch(req: DynamicFetchRequest):
         """Fetch a page using Scrapling's DynamicFetcher (Playwright/Chromium browser)."""
         logger.info("[dynamic/fetch] url=%s headless=%s network_idle=%s", req.url, req.headless, req.network_idle)
+        if _circuit_breaker_is_open():
+            logger.warning("[dynamic/fetch] 503 circuit breaker open, rejecting url=%s", req.url)
+            raise HTTPException(
+                status_code=503,
+                detail="Browser subsystem temporarily unavailable (resource exhaustion cooldown). Retry later.",
+            )
         if not await _acquire_semaphore(_get_browser_semaphore(), _QUEUE_TIMEOUT):
             logger.warning("[dynamic/fetch] 503 queue timeout url=%s (waited %ds)", req.url, _QUEUE_TIMEOUT)
             raise HTTPException(
@@ -887,10 +963,11 @@ def create_app() -> FastAPI:
             )
         try:
             loop = asyncio.get_running_loop()
-            response = await asyncio.wait_for(
-                loop.run_in_executor(_worker_pool, partial(_run_pooled_dynamic, req.url, req)),
-                timeout=_EXECUTION_TIMEOUT,
-            )
+            fut = loop.run_in_executor(_worker_pool, partial(_run_pooled_dynamic, req.url, req))
+            # Suppress "Future exception was never retrieved" when wait_for
+            # cancels the outer task but the executor thread still raises.
+            fut.add_done_callback(lambda f: f.exception() if f.done() and not f.cancelled() else None)
+            response = await asyncio.wait_for(fut, timeout=_EXECUTION_TIMEOUT)
         except asyncio.TimeoutError:
             logger.error("[dynamic/fetch] execution timeout (%ds) url=%s", _EXECUTION_TIMEOUT, req.url)
             raise HTTPException(
@@ -924,6 +1001,12 @@ def create_app() -> FastAPI:
     async def stealthy_fetch(req: StealthyFetchRequest):
         """Fetch a page using Scrapling's StealthyFetcher (stealth Chromium with anti-bot bypass)."""
         logger.info("[stealthy/fetch] url=%s headless=%s network_idle=%s", req.url, req.headless, req.network_idle)
+        if _circuit_breaker_is_open():
+            logger.warning("[stealthy/fetch] 503 circuit breaker open, rejecting url=%s", req.url)
+            raise HTTPException(
+                status_code=503,
+                detail="Browser subsystem temporarily unavailable (resource exhaustion cooldown). Retry later.",
+            )
         if not await _acquire_semaphore(_get_browser_semaphore(), _QUEUE_TIMEOUT):
             logger.warning("[stealthy/fetch] 503 queue timeout url=%s (waited %ds)", req.url, _QUEUE_TIMEOUT)
             raise HTTPException(
@@ -932,10 +1015,9 @@ def create_app() -> FastAPI:
             )
         try:
             loop = asyncio.get_running_loop()
-            response = await asyncio.wait_for(
-                loop.run_in_executor(_worker_pool, partial(_run_pooled_stealthy, req.url, req)),
-                timeout=_EXECUTION_TIMEOUT,
-            )
+            fut = loop.run_in_executor(_worker_pool, partial(_run_pooled_stealthy, req.url, req))
+            fut.add_done_callback(lambda f: f.exception() if f.done() and not f.cancelled() else None)
+            response = await asyncio.wait_for(fut, timeout=_EXECUTION_TIMEOUT)
         except asyncio.TimeoutError:
             logger.error("[stealthy/fetch] execution timeout (%ds) url=%s", _EXECUTION_TIMEOUT, req.url)
             raise HTTPException(
