@@ -56,8 +56,44 @@ def _send_telegram_alert(message: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _sentry_before_send(event: dict, hint: dict) -> dict:
-    """Forward every Sentry error event to Telegram, then let Sentry process it."""
+def _is_asyncio_playwright_noise(event: dict, hint: dict) -> bool:
+    """Detect asyncio-logged Playwright lifecycle errors already handled by the retry logic.
+
+    When a pooled browser dies, the retry path in _run_pooled_dynamic handles
+    the request-level error.  However, asyncio's event-loop exception handler
+    independently logs orphaned Futures / failed callbacks through Python
+    logging, which Sentry's LoggingIntegration captures as separate events.
+    These are noise — not user-facing failures — and should be dropped.
+    """
+    if event.get("logger") != "asyncio":
+        return False
+
+    # Check exception values for known Playwright lifecycle errors
+    exc_values = event.get("exception", {}).get("values", [])
+    for val in exc_values:
+        exc_type = val.get("type", "")
+        exc_value = val.get("value", "")
+        if exc_type == "TargetClosedError":
+            return True
+        if "switch to a different thread" in exc_value.lower():
+            return True
+
+    # Also check the log message for asyncio's "Future exception was never retrieved"
+    log_message = event.get("logentry", {}).get("message", "")
+    if not log_message:
+        log_message = event.get("message", "")
+    if "Future exception was never retrieved" in log_message and "TargetClosedError" in log_message:
+        return True
+
+    return False
+
+
+def _sentry_before_send(event: dict, hint: dict) -> dict | None:
+    """Filter noise events, forward real errors to Telegram, then let Sentry process."""
+    # Drop asyncio-logged Playwright lifecycle noise (already retried at app level)
+    if _is_asyncio_playwright_noise(event, hint):
+        return None
+
     exc_info = hint.get("exc_info")
     if exc_info:
         exc_type, exc_value, _ = exc_info
