@@ -207,17 +207,39 @@ class _BrowserSessionPool:
         # sync_playwright().start() checks for a running asyncio loop and
         # raises if one is found.  We must NOT detach when reusing a pooled
         # session — doing so kills patchright's internal greenlet event loop.
-        _detach_event_loop()
+        return self._spawn_dynamic_with_retry()
+
+    def _spawn_dynamic_with_retry(self) -> Any:
+        """Spawn a DynamicSession with retry + backoff for resource exhaustion."""
+        import time
+
         from scrapling.engines._browsers._controllers import DynamicSession
         from scrapling.engines.toolbelt.custom import BaseFetcher
 
-        session = DynamicSession(
-            headless=True,
-            extra_flags=_CONTAINER_BROWSER_FLAGS,
-            selector_config={**BaseFetcher._generate_parser_arguments()},
-        )
-        session.start()
-        return session
+        last_exc: Optional[Exception] = None
+        for attempt in range(_SPAWN_MAX_RETRIES):
+            _detach_event_loop()
+            session = DynamicSession(
+                headless=True,
+                extra_flags=_CONTAINER_BROWSER_FLAGS,
+                selector_config={**BaseFetcher._generate_parser_arguments()},
+            )
+            try:
+                session.start()
+                return session
+            except (BlockingIOError, OSError) as e:
+                last_exc = e
+                delay = _SPAWN_BACKOFF_BASE * (2**attempt)
+                logger.warning(
+                    "[pool] Browser spawn failed (attempt %d/%d): %s — retrying in %.1fs",
+                    attempt + 1,
+                    _SPAWN_MAX_RETRIES,
+                    e,
+                    delay,
+                )
+                _kill_zombie_browsers()
+                time.sleep(delay)
+        raise last_exc  # type: ignore[misc]
 
     def acquire_stealthy(self) -> Any:
         """Get a pooled StealthySession or create a new one."""
@@ -233,17 +255,39 @@ class _BrowserSessionPool:
                     pass
             except queue.Empty:
                 break
-        _detach_event_loop()
+        return self._spawn_stealthy_with_retry()
+
+    def _spawn_stealthy_with_retry(self) -> Any:
+        """Spawn a StealthySession with retry + backoff for resource exhaustion."""
+        import time
+
         from scrapling.engines._browsers._stealth import StealthySession
         from scrapling.engines.toolbelt.custom import BaseFetcher
 
-        session = StealthySession(
-            headless=True,
-            extra_flags=_CONTAINER_BROWSER_FLAGS,
-            selector_config={**BaseFetcher._generate_parser_arguments()},
-        )
-        session.start()
-        return session
+        last_exc: Optional[Exception] = None
+        for attempt in range(_SPAWN_MAX_RETRIES):
+            _detach_event_loop()
+            session = StealthySession(
+                headless=True,
+                extra_flags=_CONTAINER_BROWSER_FLAGS,
+                selector_config={**BaseFetcher._generate_parser_arguments()},
+            )
+            try:
+                session.start()
+                return session
+            except (BlockingIOError, OSError) as e:
+                last_exc = e
+                delay = _SPAWN_BACKOFF_BASE * (2**attempt)
+                logger.warning(
+                    "[pool] Stealthy browser spawn failed (attempt %d/%d): %s — retrying in %.1fs",
+                    attempt + 1,
+                    _SPAWN_MAX_RETRIES,
+                    e,
+                    delay,
+                )
+                _kill_zombie_browsers()
+                time.sleep(delay)
+        raise last_exc  # type: ignore[misc]
 
     def release(self, session: Any, pool_type: str) -> None:
         """Return a session to the pool, or close it if the pool is full."""
@@ -285,7 +329,31 @@ _CONTAINER_BROWSER_FLAGS = [
     "--renderer-process-limit=1",
     "--disable-gpu",
     "--disable-software-rasterizer",
+    "--no-zygote",
+    "--single-process",
+    "--disable-dev-shm-usage",
+    "--disable-extensions",
 ]
+
+_SPAWN_MAX_RETRIES = int(os.environ.get("SCRAPLING_SPAWN_RETRIES", "3"))
+_SPAWN_BACKOFF_BASE = float(os.environ.get("SCRAPLING_SPAWN_BACKOFF", "1.5"))
+
+
+def _kill_zombie_browsers() -> None:
+    """Best-effort cleanup of orphaned chromium/playwright node processes."""
+    import subprocess as _sp
+
+    for pattern in ("chromium", "chrome", "playwright"):
+        try:
+            result = _sp.run(  # nosec B603 B607 — pattern is a hardcoded constant, not user input
+                ["pkill", "-f", pattern],
+                capture_output=True,
+                timeout=3,
+            )
+            if result.returncode == 0:
+                logger.info("[pool] killed zombie processes matching %r", pattern)
+        except Exception:
+            pass
 
 
 def _is_poolable_dynamic(req: "DynamicFetchRequest") -> bool:
@@ -903,7 +971,19 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     def startup_event():
-        """Notify that the server is live."""
+        """Pre-warm browser pool and notify that the server is live."""
+
+        def _prewarm():
+            try:
+                logger.info("[startup] Pre-warming browser pool (%d dynamic sessions)...", _MAX_BROWSERS)
+                for _ in range(_MAX_BROWSERS):
+                    session = _browser_pool.acquire_dynamic()
+                    _browser_pool.release(session, "dynamic")
+                logger.info("[startup] Browser pool pre-warmed successfully")
+            except Exception as e:
+                logger.warning("[startup] Pre-warm failed (will create on demand): %s", e)
+
+        _worker_pool.submit(_prewarm)
         _send_telegram_alert("<b>Scrapling API</b>\nServer is live and accepting requests.")
 
     @app.on_event("shutdown")
